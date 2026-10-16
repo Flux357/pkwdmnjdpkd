@@ -30,7 +30,7 @@ from aiogram.types import (
 
 # ─────────────────────────── Конфигурация ───────────────────────────
 
-BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "8980577514:AAEcyyyIIWrZlZZg2XoNyblIn9pQKsXgg3k")
+BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН")
 BOT_USERNAME: Final[str] = os.getenv("BOT_USERNAME", "velem1Xbivbot")
 
 SUPERADMIN_ID: Final[int] = 8093996396
@@ -656,7 +656,7 @@ class Game:
     duration: int = DEFAULT_DURATION
     leader: Optional[Leader] = None
     leader_message_id: Optional[int] = None
-    remaining: int = 0                                  # ← текущее оставшееся время
+    remaining: int = 0
     _timer: Optional[asyncio.Task[None]] = field(default=None, repr=False)
     _started: bool = field(default=False, repr=False)
 
@@ -682,7 +682,7 @@ class Game:
             self.set_duration(duration)
         self.leader = None
         self.leader_message_id = None
-        self.remaining = self.duration                          # ← старт с полного
+        self.remaining = self.duration
         self._timer = None
         self._started = True
 
@@ -696,11 +696,15 @@ class Game:
         self._started = False
 
     async def promote(self, bot: Bot, leader: Leader) -> None:
-        """Перебитие: меняем лидера, таймер ПРОДОЛЖАЕТСЯ с текущего remaining."""
+        """Перебитие: сбрасываем таймер на полный duration, меняем лидера."""
         old_msg_id = self.leader_message_id
 
-        # НЕ отменяем таймер! Просто меняем лидера.
+        # Отменяем старый таймер
+        self._cancel_timer()
+
+        # Меняем лидера и СБРАСЫВАЕМ таймер на полный
         self.leader = leader
+        self.remaining = self.duration
 
         # Удаляем старое сообщение (если было)
         if old_msg_id is not None:
@@ -709,7 +713,7 @@ class Game:
             except TelegramBadRequest as e:
                 log.debug("Не удалил старое сообщение %s: %s", old_msg_id, e)
 
-        # Шлём новое сообщение с ТЕКУЩИМ remaining
+        # Шлём новое сообщение с полным временем
         text = (
             f"{t('game_flood')}\n\n"
             f"{t('game_new_leader')}: {leader.name}\n"
@@ -723,11 +727,10 @@ class Game:
             log.warning("Не смог отправить сообщение: %s", e)
             self.leader_message_id = None
 
-        # Если таймер по какой-то причине не идёт — запускаем
-        if not self.running:
-            self._timer = asyncio.create_task(
-                self._run_timer(bot), name=f"game-{self.chat_id}"
-            )
+        # Запускаем новый таймер с полным временем
+        self._timer = asyncio.create_task(
+            self._run_timer(bot), name=f"game-{self.chat_id}"
+        )
 
     async def _run_timer(self, bot: Bot) -> None:
         try:
@@ -736,7 +739,6 @@ class Game:
                 self.remaining -= 1
 
                 if self.leader is None or self.leader_message_id is None:
-                    # Лидера нет — заканчиваем
                     return
 
                 if self.remaining % TIMER_UPDATE_EVERY != 0 and self.remaining != 0:
