@@ -30,7 +30,7 @@ from aiogram.types import (
 
 # ─────────────────────────── Конфигурация ───────────────────────────
 
-BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН")
+BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "8980577514:AAEcyyyIIWrZlZZg2XoNyblIn9pQKsXgg3k")
 BOT_USERNAME: Final[str] = os.getenv("BOT_USERNAME", "velem1Xbivbot")
 
 SUPERADMIN_ID: Final[int] = 8093996396
@@ -184,16 +184,16 @@ STRINGS: Final[dict[str, dict[str, str]]] = {
         "chat_name": "📌 Название",
         "chat_id": "🆔 Chat ID",
         "chat_added_by": "👤 Добавил",
-        "game_started": "🎮 Игра запущена",
-        "game_seconds": "⏱ {} сек",
-        "game_hint": "Пиши сообщение — станешь лидером.",
+        "game_started": "🎮 Игра началась",
+        "game_seconds": "⏱ {} секунд",
+        "game_hint": "Пиши сообщения - выйграешь подарок",
         "game_stopped": "🛑 Игра остановлена.",
         "game_already": "Игра уже идёт.",
         "game_not_running": "Игра и так не идёт.",
         "game_invalid_duration": "Время должно быть от {} до {} сек.",
         "game_bad_number": "Время должно быть числом. Пример: /biv start 60",
-        "game_flood": "Перебито",
-        "game_new_leader": "Лидер",
+        "game_flood": "🔄 Перебито!",
+        "game_new_leader": "Новый лидер",
         "game_time_left": "До конца",
         "game_winner": "🏆 Победитель",
         "game_message": "Сообщение",
@@ -381,8 +381,8 @@ STRINGS: Final[dict[str, dict[str, str]]] = {
         "game_not_running": "Game is not running.",
         "game_invalid_duration": "Time must be between {} and {} sec.",
         "game_bad_number": "Time must be a number. Example: /biv start 60",
-        "game_flood": "Interrupted",
-        "game_new_leader": "Leader",
+        "game_flood": "🔄 Interrupted!",
+        "game_new_leader": "New leader",
         "game_time_left": "Time left",
         "game_winner": "🏆 Winner",
         "game_message": "Message",
@@ -656,7 +656,7 @@ class Game:
     duration: int = DEFAULT_DURATION
     leader: Optional[Leader] = None
     leader_message_id: Optional[int] = None
-    remaining: int = 0
+    remaining: int = 0                                  # ← текущее оставшееся время
     _timer: Optional[asyncio.Task[None]] = field(default=None, repr=False)
     _started: bool = field(default=False, repr=False)
 
@@ -682,7 +682,7 @@ class Game:
             self.set_duration(duration)
         self.leader = None
         self.leader_message_id = None
-        self.remaining = self.duration
+        self.remaining = self.duration                          # ← старт с полного
         self._timer = None
         self._started = True
 
@@ -696,20 +696,20 @@ class Game:
         self._started = False
 
     async def promote(self, bot: Bot, leader: Leader) -> None:
-        """Перебитие: сбрасываем таймер на полный duration, меняем лидера."""
+        """Перебитие: меняем лидера, таймер ПРОДОЛЖАЕТСЯ с текущего remaining."""
         old_msg_id = self.leader_message_id
 
-        self._cancel_timer()
-
+        # НЕ отменяем таймер! Просто меняем лидера.
         self.leader = leader
-        self.remaining = self.duration
 
+        # Удаляем старое сообщение (если было)
         if old_msg_id is not None:
             try:
                 await bot.delete_message(self.chat_id, old_msg_id)
             except TelegramBadRequest as e:
                 log.debug("Не удалил старое сообщение %s: %s", old_msg_id, e)
 
+        # Шлём новое сообщение с ТЕКУЩИМ remaining
         text = (
             f"{t('game_flood')}\n\n"
             f"{t('game_new_leader')}: {leader.name}\n"
@@ -723,9 +723,11 @@ class Game:
             log.warning("Не смог отправить сообщение: %s", e)
             self.leader_message_id = None
 
-        self._timer = asyncio.create_task(
-            self._run_timer(bot), name=f"game-{self.chat_id}"
-        )
+        # Если таймер по какой-то причине не идёт — запускаем
+        if not self.running:
+            self._timer = asyncio.create_task(
+                self._run_timer(bot), name=f"game-{self.chat_id}"
+            )
 
     async def _run_timer(self, bot: Bot) -> None:
         try:
@@ -734,6 +736,7 @@ class Game:
                 self.remaining -= 1
 
                 if self.leader is None or self.leader_message_id is None:
+                    # Лидера нет — заканчиваем
                     return
 
                 if self.remaining % TIMER_UPDATE_EVERY != 0 and self.remaining != 0:
@@ -788,6 +791,7 @@ class Game:
                     except TelegramBadRequest:
                         pass
 
+            # 🏆 Закрепляем сообщение победителя
             if self.leader_message_id is not None:
                 try:
                     await bot.pin_chat_message(
