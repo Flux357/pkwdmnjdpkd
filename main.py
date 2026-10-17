@@ -1,5 +1,5 @@
 """
-Telegram-бот «Перебей лидера» с системой доступа, настройками и языками RU/EN.
+Telegram-бот «Перебей лидера» с системой доступа, настройками и БД (SQLite).
 
 Роли:
     SUPERADMIN  — полный доступ
@@ -18,6 +18,7 @@ import os
 from dataclasses import dataclass, field, asdict
 from typing import Final, Optional
 
+import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
@@ -40,6 +41,7 @@ MIN_DURATION: Final[int] = 5
 MAX_DURATION: Final[int] = 3600
 
 BACKUP_FILE: Final[str] = "backup.json"
+DB_FILE: Final[str] = "bot.db"
 
 TIMER_UPDATE_EVERY: Final[int] = 5
 
@@ -172,8 +174,7 @@ STRINGS: Final[dict[str, dict[str, str]]] = {
         "add_chat_2": "<b>2.</b> Чат → Управление → Добавить участника.",
         "add_chat_3": (
             "<b>3.</b> Управление → Администраторы → выдать права:\n"
-            "     • Удаление сообщений\n"
-            "     • Закрепление сообщений"
+            "     • Удаление сообщений"
         ),
         "add_chat_4": "<b>4.</b> @BotFather → Group Privacy → Turn off",
         "add_chat_5": "<b>5.</b> В чате: <code>/biv start 60</code>",
@@ -192,8 +193,8 @@ STRINGS: Final[dict[str, dict[str, str]]] = {
         "game_not_running": "Игра и так не идёт.",
         "game_invalid_duration": "Время должно быть от {} до {} сек.",
         "game_bad_number": "Время должно быть числом. Пример: /biv start 60",
-        "game_flood": "🔄 Перебито!",
-        "game_new_leader": "Новый лидер",
+        "game_flood": "Перебито",
+        "game_new_leader": "Лидер",
         "game_time_left": "До конца",
         "game_winner": "🏆 Победитель",
         "game_message": "Сообщение",
@@ -361,8 +362,7 @@ STRINGS: Final[dict[str, dict[str, str]]] = {
         "add_chat_2": "<b>2.</b> Chat → Manage → Add member.",
         "add_chat_3": (
             "<b>3.</b> Manage → Administrators → grant rights:\n"
-            "     • Delete messages\n"
-            "     • Pin messages"
+            "     • Delete messages"
         ),
         "add_chat_4": "<b>4.</b> @BotFather → Group Privacy → Turn off",
         "add_chat_5": "<b>5.</b> In chat: <code>/biv start 60</code>",
@@ -374,15 +374,15 @@ STRINGS: Final[dict[str, dict[str, str]]] = {
         "chat_id": "🆔 Chat ID",
         "chat_added_by": "👤 Added by",
         "game_started": "🎮 Game started",
-        "game_seconds": "⏱ {} sec",
-        "game_hint": "Send a message — become the leader.",
+        "game_seconds": "⏱ {} seconds",
+        "game_hint": "Send messages - win a gift",
         "game_stopped": "🛑 Game stopped.",
         "game_already": "Game is already running.",
         "game_not_running": "Game is not running.",
         "game_invalid_duration": "Time must be between {} and {} sec.",
         "game_bad_number": "Time must be a number. Example: /biv start 60",
-        "game_flood": "🔄 Interrupted!",
-        "game_new_leader": "New leader",
+        "game_flood": "Interrupted",
+        "game_new_leader": "Leader",
         "game_time_left": "Time left",
         "game_winner": "🏆 Winner",
         "game_message": "Message",
@@ -466,7 +466,7 @@ class Settings:
         return any(w.lower() in low for w in self.bad_words if w)
 
 
-# ─────────────────────────── Пользователи ───────────────────────────
+# ─────────────────────────── БД и Пользователи ───────────────────────────
 
 @dataclass
 class UserInfo:
@@ -478,13 +478,74 @@ class UserInfo:
     is_admin: bool = False
 
 
-class UserStore:
-    def __init__(self, superadmin_id: int) -> None:
-        self._users: dict[int, UserInfo] = {}
-        self._superadmin_id = superadmin_id
+class Database:
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        self.conn: Optional[aiosqlite.Connection] = None
 
-    def touch(self, user: types.User) -> UserInfo:
-        info = self._users.get(user.id)
+    async def connect(self) -> None:
+        self.conn = await aiosqlite.connect(self.db_path)
+        self.conn.row_factory = aiosqlite.Row
+        await self._create_tables()
+
+    async def close(self) -> None:
+        if self.conn:
+            await self.conn.close()
+
+    async def _create_tables(self) -> None:
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT,
+                username TEXT,
+                approved INTEGER DEFAULT 0,
+                banned INTEGER DEFAULT 0,
+                is_admin INTEGER DEFAULT 0
+            )
+        """)
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT
+            )
+        """)
+        await self.conn.commit()
+
+
+class UserStore:
+    def __init__(self, db: Database, superadmin_id: int) -> None:
+        self.db = db
+        self._superadmin_id = superadmin_id
+        self._cache: dict[int, UserInfo] = {}
+
+    async def load_cache(self) -> None:
+        """Загружаем всех юзеров из БД в память при старте."""
+        if not self.db.conn:
+            return
+        async with self.db.conn.execute("SELECT * FROM users") as cursor:
+            async for row in cursor:
+                u = UserInfo(
+                    user_id=row["user_id"],
+                    name=row["name"],
+                    username=row["username"],
+                    approved=bool(row["approved"]),
+                    banned=bool(row["banned"]),
+                    is_admin=bool(row["is_admin"]),
+                )
+                self._cache[u.user_id] = u
+        log.info("Загружено юзеров из БД: %d", len(self._cache))
+
+    async def _save(self, u: UserInfo) -> None:
+        if not self.db.conn:
+            return
+        await self.db.conn.execute("""
+            INSERT OR REPLACE INTO users (user_id, name, username, approved, banned, is_admin)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (u.user_id, u.name, u.username, int(u.approved), int(u.banned), int(u.is_admin)))
+        await self.db.conn.commit()
+
+    async def touch(self, user: types.User) -> UserInfo:
+        info = self._cache.get(user.id)
         if info is None:
             info = UserInfo(
                 user_id=user.id,
@@ -493,14 +554,17 @@ class UserStore:
                 approved=(user.id == self._superadmin_id),
                 is_admin=(user.id == self._superadmin_id),
             )
-            self._users[user.id] = info
+            self._cache[user.id] = info
+            await self._save(info)
         else:
-            info.name = user.full_name
-            info.username = user.username
+            if info.name != user.full_name or info.username != user.username:
+                info.name = user.full_name
+                info.username = user.username
+                await self._save(info)
         return info
 
     def get(self, user_id: int) -> Optional[UserInfo]:
-        return self._users.get(user_id)
+        return self._cache.get(user_id)
 
     def is_superadmin(self, user_id: int) -> bool:
         return user_id == self._superadmin_id
@@ -508,84 +572,89 @@ class UserStore:
     def is_admin(self, user_id: int) -> bool:
         if self.is_superadmin(user_id):
             return True
-        info = self._users.get(user_id)
+        info = self._cache.get(user_id)
         return info is not None and info.is_admin and not info.banned
 
     def has_access(self, user_id: int) -> bool:
         if self.is_superadmin(user_id):
             return True
-        info = self._users.get(user_id)
+        info = self._cache.get(user_id)
         if info is None:
             return False
         return info.approved and not info.banned
 
-    def approve(self, uid: int) -> bool:
-        info = self._users.get(uid)
+    async def approve(self, uid: int) -> bool:
+        info = self._cache.get(uid)
         if info is None:
             return False
         info.approved = True
         info.banned = False
+        await self._save(info)
         return True
 
-    def ban(self, uid: int) -> bool:
-        info = self._users.get(uid)
+    async def ban(self, uid: int) -> bool:
+        info = self._cache.get(uid)
         if info is None:
             return False
         info.banned = True
         info.approved = False
         info.is_admin = False
+        await self._save(info)
         return True
 
-    def unban(self, uid: int) -> bool:
-        info = self._users.get(uid)
+    async def unban(self, uid: int) -> bool:
+        info = self._cache.get(uid)
         if info is None:
             return False
         info.banned = False
+        await self._save(info)
         return True
 
-    def make_admin(self, uid: int) -> bool:
+    async def make_admin(self, uid: int) -> bool:
         if self.is_superadmin(uid):
             return False
-        info = self._users.get(uid)
+        info = self._cache.get(uid)
         if info is None:
             return False
         info.is_admin = True
         info.approved = True
         info.banned = False
+        await self._save(info)
         return True
 
-    def remove_admin(self, uid: int) -> bool:
-        info = self._users.get(uid)
+    async def remove_admin(self, uid: int) -> bool:
+        info = self._cache.get(uid)
         if info is None:
             return False
         info.is_admin = False
+        await self._save(info)
         return True
 
-    def remove_user(self, uid: int) -> bool:
+    async def remove_user(self, uid: int) -> bool:
         if self.is_superadmin(uid):
             return False
-        if uid in self._users:
-            del self._users[uid]
+        if uid in self._cache:
+            del self._cache[uid]
+            if self.db.conn:
+                await self.db.conn.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+                await self.db.conn.commit()
             return True
         return False
 
     def all_users(self) -> list[UserInfo]:
-        return list(self._users.values())
+        return list(self._cache.values())
 
     def pending_users(self) -> list[UserInfo]:
         return [
-            u for u in self._users.values()
+            u for u in self._cache.values()
             if not u.approved and not u.banned and not self.is_superadmin(u.user_id)
         ]
 
     def banned_users(self) -> list[UserInfo]:
-        return [u for u in self._users.values() if u.banned]
+        return [u for u in self._cache.values() if u.banned]
 
     def admins(self) -> list[UserInfo]:
-        return [u for u in self._users.values() if u.is_admin and not u.banned]
-
-    def load(self, data: dict[int, UserInfo]) -> None:
-        self._users = data
+        return [u for u in self._cache.values() if u.is_admin and not u.banned]
 
 
 # ─────────────────────────── Игровые модели ───────────────────────────
@@ -640,15 +709,6 @@ class Stats:
             out[str(chat_id)] = {str(uid): asdict(st) for uid, st in chat.items()}
         return out
 
-    def import_(self, raw: dict) -> None:
-        self._data = {}
-        for chat_id_str, chat in raw.items():
-            chat_id = int(chat_id_str)
-            self._data[chat_id] = {}
-            for uid_str, st in chat.items():
-                uid = int(uid_str)
-                self._data[chat_id][uid] = PlayerStat(**st)
-
 
 @dataclass
 class Game:
@@ -656,7 +716,7 @@ class Game:
     duration: int = DEFAULT_DURATION
     leader: Optional[Leader] = None
     leader_message_id: Optional[int] = None
-    remaining: int = 0                                  # ← текущее оставшееся время
+    remaining: int = 0
     _timer: Optional[asyncio.Task[None]] = field(default=None, repr=False)
     _started: bool = field(default=False, repr=False)
 
@@ -682,7 +742,7 @@ class Game:
             self.set_duration(duration)
         self.leader = None
         self.leader_message_id = None
-        self.remaining = self.duration                          # ← старт с полного
+        self.remaining = self.duration
         self._timer = None
         self._started = True
 
@@ -696,11 +756,15 @@ class Game:
         self._started = False
 
     async def promote(self, bot: Bot, leader: Leader) -> None:
-        """Перебитие: меняем лидера, таймер ПРОДОЛЖАЕТСЯ с текущего remaining."""
+        """Перебитие: сбрасываем таймер на полный duration, меняем лидера."""
         old_msg_id = self.leader_message_id
 
-        # НЕ отменяем таймер! Просто меняем лидера.
+        # Отменяем старый таймер
+        self._cancel_timer()
+
+        # Меняем лидера и СБРАСЫВАЕМ таймер на полный
         self.leader = leader
+        self.remaining = self.duration
 
         # Удаляем старое сообщение (если было)
         if old_msg_id is not None:
@@ -709,7 +773,7 @@ class Game:
             except TelegramBadRequest as e:
                 log.debug("Не удалил старое сообщение %s: %s", old_msg_id, e)
 
-        # Шлём новое сообщение с ТЕКУЩИМ remaining
+        # Шлём новое сообщение с полным временем
         text = (
             f"{t('game_flood')}\n\n"
             f"{t('game_new_leader')}: {leader.name}\n"
@@ -723,11 +787,10 @@ class Game:
             log.warning("Не смог отправить сообщение: %s", e)
             self.leader_message_id = None
 
-        # Если таймер по какой-то причине не идёт — запускаем
-        if not self.running:
-            self._timer = asyncio.create_task(
-                self._run_timer(bot), name=f"game-{self.chat_id}"
-            )
+        # Запускаем новый таймер с полным временем
+        self._timer = asyncio.create_task(
+            self._run_timer(bot), name=f"game-{self.chat_id}"
+        )
 
     async def _run_timer(self, bot: Bot) -> None:
         try:
@@ -736,7 +799,6 @@ class Game:
                 self.remaining -= 1
 
                 if self.leader is None or self.leader_message_id is None:
-                    # Лидера нет — заканчиваем
                     return
 
                 if self.remaining % TIMER_UPDATE_EVERY != 0 and self.remaining != 0:
@@ -790,8 +852,6 @@ class Game:
                         await bot.send_message(chat_id=self.chat_id, text=final_text)
                     except TelegramBadRequest:
                         pass
-
-            
 
             stats.add_win(self.chat_id, winner.user_id, winner.name)
             log.info("Победа в чате %s: %s", self.chat_id, winner.name)
@@ -851,8 +911,10 @@ class GameManager:
 router = Router()
 manager = GameManager()
 stats = Stats()
-users = UserStore(SUPERADMIN_ID)
 settings = Settings()
+
+db = Database(DB_FILE)
+users = UserStore(db, SUPERADMIN_ID)
 
 known_chats: dict[int, str] = {}
 
@@ -1212,7 +1274,7 @@ async def cmd_start(message: types.Message, bot: Bot) -> None:
     user = message.from_user
     if user is None:
         return
-    info = users.touch(user)
+    info = await users.touch(user)
 
     if message.chat.type != "private":
         return
@@ -1278,7 +1340,7 @@ async def cb_profile(call: CallbackQuery) -> None:
     if call.message is None:
         await call.answer()
         return
-    info = users.touch(call.from_user)
+    info = await users.touch(call.from_user)
     await call.message.edit_text(
         _profile_text(call.from_user, info),
         parse_mode="HTML",
@@ -1559,58 +1621,6 @@ async def cb_backup_export(call: CallbackQuery) -> None:
         if call.message is not None:
             await call.message.edit_text(
                 f"{t('backup_error_export')} <code>{e}</code>",
-                parse_mode="HTML",
-                reply_markup=kb_backup_menu(),
-            )
-    await call.answer()
-
-
-@router.callback_query(F.data == "backup:import")
-async def cb_backup_import(call: CallbackQuery) -> None:
-    if not _is_admin(call.from_user):
-        await call.answer(t("no_access"), show_alert=True)
-        return
-    if not os.path.exists(BACKUP_FILE):
-        await call.answer(t("backup_no_file"), show_alert=True)
-        return
-    try:
-        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        loaded_users: dict[int, UserInfo] = {}
-        for u in data.get("users", []):
-            info = UserInfo(**u)
-            loaded_users[info.user_id] = info
-        users.load(loaded_users)
-
-        known_chats.clear()
-        for k, v in data.get("chats", {}).items():
-            known_chats[int(k)] = v
-
-        stats.import_(data.get("stats", {}))
-
-        s = data.get("settings", {})
-        settings.enabled = s.get("enabled", True)
-        settings.antiflood = s.get("antiflood", True)
-        settings.bad_words = s.get("bad_words", settings.bad_words)
-        settings.language = s.get("language", "ru")
-        settings.notify_joins = s.get("notify_joins", True)
-        settings.notify_leaves = s.get("notify_leaves", True)
-        settings.notify_requests = s.get("notify_requests", True)
-        settings.notify_wins = s.get("notify_wins", False)
-
-        if call.message is not None:
-            await call.message.edit_text(
-                f"{t('backup_restored')}\n\n"
-                f"{len(loaded_users)} / {len(known_chats)}",
-                parse_mode="HTML",
-                reply_markup=kb_backup_menu(),
-            )
-    except Exception as e:
-        log.exception("Ошибка импорта")
-        if call.message is not None:
-            await call.message.edit_text(
-                f"{t('backup_error_import')} <code>{e}</code>",
                 parse_mode="HTML",
                 reply_markup=kb_backup_menu(),
             )
@@ -1918,13 +1928,13 @@ async def cb_quick_pick(call: CallbackQuery, bot: Bot) -> None:
         return
 
     if kind == "quick_ban":
-        users.ban(target_id)
+        await users.ban(target_id)
         try:
             await bot.send_message(target_id, t("notify_banned"))
         except Exception:
             pass
     elif kind == "quick_unban":
-        users.unban(target_id)
+        await users.unban(target_id)
         try:
             await bot.send_message(target_id, t("notify_unbanned"))
         except Exception:
@@ -1933,7 +1943,7 @@ async def cb_quick_pick(call: CallbackQuery, bot: Bot) -> None:
         if not users.is_superadmin(call.from_user.id):
             await call.answer(t("only_superadmin"), show_alert=True)
             return
-        users.make_admin(target_id)
+        await users.make_admin(target_id)
         try:
             await bot.send_message(target_id, t("notify_makeadmin"))
         except Exception:
@@ -1942,7 +1952,7 @@ async def cb_quick_pick(call: CallbackQuery, bot: Bot) -> None:
         if not users.is_superadmin(call.from_user.id):
             await call.answer(t("only_superadmin"), show_alert=True)
             return
-        users.remove_admin(target_id)
+        await users.remove_admin(target_id)
         try:
             await bot.send_message(target_id, t("notify_removeadmin"))
         except Exception:
@@ -1994,37 +2004,37 @@ async def cb_user_action(call: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "approve":
-        users.approve(target_id)
+        await users.approve(target_id)
         try:
             await bot.send_message(target_id, t("notify_approved"))
         except Exception:
             pass
     elif action == "ban":
-        users.ban(target_id)
+        await users.ban(target_id)
         try:
             await bot.send_message(target_id, t("notify_banned"))
         except Exception:
             pass
     elif action == "unban":
-        users.unban(target_id)
+        await users.unban(target_id)
         try:
             await bot.send_message(target_id, t("notify_unbanned"))
         except Exception:
             pass
     elif action == "makeadmin":
-        users.make_admin(target_id)
+        await users.make_admin(target_id)
         try:
             await bot.send_message(target_id, t("notify_makeadmin"))
         except Exception:
             pass
     elif action == "removeadmin":
-        users.remove_admin(target_id)
+        await users.remove_admin(target_id)
         try:
             await bot.send_message(target_id, t("notify_removeadmin"))
         except Exception:
             pass
     elif action == "remove":
-        users.remove_user(target_id)
+        await users.remove_user(target_id)
 
     if call.message is not None:
         fresh = users.get(target_id)
@@ -2112,7 +2122,7 @@ async def cmd_makeadmin(message: types.Message) -> None:
     except ValueError:
         await message.answer(t("cmd_id_number"))
         return
-    if users.make_admin(uid):
+    if await users.make_admin(uid):
         await message.answer(t("cmd_made_admin").format(uid))
     else:
         await message.answer(t("cmd_user_first_start"))
@@ -2131,7 +2141,7 @@ async def cmd_unmakeadmin(message: types.Message) -> None:
     except ValueError:
         await message.answer(t("cmd_id_number"))
         return
-    if users.remove_admin(uid):
+    if await users.remove_admin(uid):
         await message.answer(t("cmd_removed_admin").format(uid))
     else:
         await message.answer(t("user_not_found"))
@@ -2150,7 +2160,7 @@ async def cmd_ban(message: types.Message) -> None:
     except ValueError:
         await message.answer(t("cmd_id_number"))
         return
-    if users.ban(uid):
+    if await users.ban(uid):
         await message.answer(t("cmd_banned").format(uid))
     else:
         await message.answer(t("user_not_found"))
@@ -2169,7 +2179,7 @@ async def cmd_unban(message: types.Message) -> None:
     except ValueError:
         await message.answer(t("cmd_id_number"))
         return
-    if users.unban(uid):
+    if await users.unban(uid):
         await message.answer(t("cmd_unbanned").format(uid))
     else:
         await message.answer(t("user_not_found"))
@@ -2188,7 +2198,7 @@ async def cmd_approve(message: types.Message, bot: Bot) -> None:
     except ValueError:
         await message.answer(t("cmd_id_number"))
         return
-    if users.approve(uid):
+    if await users.approve(uid):
         try:
             await bot.send_message(uid, t("notify_approved"))
         except Exception:
@@ -2245,6 +2255,12 @@ async def on_bot_added(event: types.ChatMemberUpdated, bot: Bot) -> None:
 
         if chat.type in ("group", "supergroup"):
             known_chats[chat.id] = chat.title or "Без названия"
+            if db.conn:
+                await db.conn.execute(
+                    "INSERT OR REPLACE INTO chats (chat_id, title) VALUES (?, ?)",
+                    (chat.id, known_chats[chat.id])
+                )
+                await db.conn.commit()
 
         if settings.notify_joins:
             try:
@@ -2262,6 +2278,10 @@ async def on_bot_added(event: types.ChatMemberUpdated, bot: Bot) -> None:
 
     elif not was_out and new_status in ("left", "kicked"):
         known_chats.pop(chat.id, None)
+        if db.conn:
+            await db.conn.execute("DELETE FROM chats WHERE chat_id = ?", (chat.id,))
+            await db.conn.commit()
+            
         if settings.notify_leaves:
             try:
                 await bot.send_message(
@@ -2404,6 +2424,11 @@ def setup_logging() -> None:
 
 async def main() -> None:
     setup_logging()
+    
+    # Инициализация БД и загрузка кэша
+    await db.connect()
+    await users.load_cache()
+
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
@@ -2412,6 +2437,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        await db.close()
         await bot.session.close()
         log.info("Бот остановлен")
 
