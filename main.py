@@ -791,16 +791,7 @@ class Game:
                     except TelegramBadRequest:
                         pass
 
-            # 🏆 Закрепляем сообщение победителя
-            if self.leader_message_id is not None:
-                try:
-                    await bot.pin_chat_message(
-                        chat_id=self.chat_id,
-                        message_id=self.leader_message_id,
-                        disable_notification=True,
-                    )
-                except TelegramBadRequest as e:
-                    log.warning("Не смог закрепить победителя в %s: %s", self.chat_id, e)
+            
 
             stats.add_win(self.chat_id, winner.user_id, winner.name)
             log.info("Победа в чате %s: %s", self.chat_id, winner.name)
